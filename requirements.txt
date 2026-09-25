@@ -1,5 +1,4 @@
-Flask
-requests
 yfinance
 pandas
-lxml
+pandas_ta
+requests
