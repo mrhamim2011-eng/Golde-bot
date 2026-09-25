@@ -122,4 +122,4 @@ def run_bot():
             print(f"Loop Error: {e}")
             time.sleep(60)
 
-threading.Thread(target=run_bot).start()si
+threading.Thread(target=run_bot).start()
