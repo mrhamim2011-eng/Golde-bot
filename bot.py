@@ -1,125 +1,110 @@
-import os
-import time
-import threading
-import requests
-from datetime import datetime
-from flask import Flask
-import yfinance as yf
+import os, time, requests, yfinance as yf, json
 import pandas as pd
+import pandas_ta as ta
+from datetime import datetime
 
-# ====== RENDER PORT FIX ======
-app = Flask('')
-@app.route('/')
-def home(): return "PRO GOLD BOT IS LIVE!"
-threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000)).start()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# ====== CONFIG ======
-BOT_TOKEN = "8975288953:AAENyWD2nWDaMAUeYsMKPpGv-_dj6dCgFiw" # Render Env Variable এ দিতে হবে
-CHAT_ID = "8960830581"      # তোমার Telegram ID
-
-def send_telegram(msg):
+# Bot State
+STATE_FILE = "bot_state.json"
+def load_state():
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        requests.post(url, data=data)
-    except Exception as e:
-        print(f"Error: {e}")
+        with open(STATE_FILE, 'r') as f: return json.load(f)
+    except: return {"is_on": True, "wins": 0, "losses": 0, "active_trade": None}
 
-def get_gold_data():
+def save_state(s):
+    with open(STATE_FILE, 'w') as f: json.dump(f, f)
+
+state = load_state()
+last_update_id = 0
+
+def send(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try: requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    except: pass
+
+def check_commands():
+    global last_update_id, state
     try:
-        gold = yf.download("GC=F", period="1d", interval="5m", progress=False)
-        if len(gold) < 50: return None, 0
-        close = gold['Close'].iloc[-1].item()
-        
-        # Simple BOS Logic
-        high_20 = gold['High'].tail(20).max().item()
-        low_20 = gold['Low'].tail(20).min().item()
-        
-        score = 50
-        signal_type = None
-        
-        if close > high_20:
-            signal_type = "BUY"
-            score = 82
-        elif close < low_20:
-            signal_type = "SELL"
-            score = 84
-        else:
-            signal_type = "WAIT"
-            score = 55
-            
-        return close, signal_type, score, high_20, low_20
-    except Exception as e:
-        print(e)
-        return None, "WAIT", 0, 0, 0
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update_id+1}&timeout=5"
+        r = requests.get(url, timeout=10).json()
+        for upd in r.get("result", []):
+            last_update_id = upd["update_id"]
+            msg = upd.get("message", {}).get("text", "").lower()
+            if "/on" in msg or "/start" in msg:
+                state["is_on"] = True; save_state(state)
+                send("🟢 *BOT ON* - এখন থেকে প্রতি 5 মিনিটে Price + Signal আসবে")
+            elif "/off" in msg or "/stop" in msg:
+                state["is_on"] = False; save_state(state)
+                send("🔴 *BOT OFF* - বট বন্ধ করা হলো। চালু করতে /on লিখো")
+            elif "/report" in msg:
+                total = state["wins"]+state["losses"]
+                wr = (state["wins"]/total*100) if total>0 else 0
+                send(f"📊 *REPORT*\nWin: {state['wins']}\nLoss: {state['losses']}\nWin Rate: {wr:.1f}%")
+            elif "/price" in msg:
+                p = yf.download("XAUUSD=X", period="1d", interval="1m", progress=False)['Close'].iloc[-1]
+                send(f"💵 *XAUUSD Live:* `${p:.2f}`")
+    except: pass
 
-def format_pro_signal(price, sig_type, score, high, low):
-    now = datetime.now().strftime("%I:%M %p")
+def analyze_xau():
+    df = yf.download("XAUUSD=X", period="5d", interval="5m", progress=False)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    df.ta.ema(length=50, append=True); df.ta.ema(length=200, append=True)
+    df.ta.rsi(length=14, append=True); df.ta.macd(append=True); df.ta.atr(length=14, append=True)
+    df = df.dropna()
+    l = df.iloc[-1]
+    price = float(l['Close']); atr = float(l['ATRr_14'])
     
-    if sig_type == "WAIT":
-        return None  # WAIT হলে মেসেজ পাঠাবে না, শুধু Strong Signal পাঠাবে
+    score = 0
+    if l['EMA_50'] > l['EMA_200']: score+=40
+    else: score-=40
+    if l['RSI_14']>55 and l['RSI_14']<70: score+=30
+    if l['RSI_14']<45 and l['RSI_14']>30: score-=30
+    if l['MACD_12_26_9'] > l['MACDs_12_26_9']: score+=30
+    else: score-=30
 
-    if sig_type == "BUY":
-        entry = price
-        sl = entry - 10
-        tp1 = entry + 10
-        tp2 = entry + 20
-        tp3 = entry + 35
-        emoji = "🟢"
-        action = "BUY / LONG"
-    else:
-        entry = price
-        sl = entry + 10
-        tp1 = entry - 10
-        tp2 = entry - 20
-        tp3 = entry - 35
-        emoji = "🔴"
-        action = "SELL / SHORT"
+    if score >= 75: return "BUY", price, price-atr*1.8, price+atr*3, score
+    if score <= -75: return "SELL", price, price+atr*1.8, price-atr*3, abs(score)
+    return None, price, None, None, score
 
-    msg = f"""
-{emoji} **NEXT LEVEL GOLD {action}** {emoji}
+def check_trade_result(current_price):
+    global state
+    if not state["active_trade"]: return
+    tr = state["active_trade"]
+    side, entry, sl, tp = tr["side"], tr["entry"], tr["sl"], tr["tp"]
+    
+    hit_tp = (side=="BUY" and current_price>=tp) or (side=="SELL" and current_price<=tp)
+    hit_sl = (side=="BUY" and current_price<=sl) or (side=="SELL" and current_price>=sl)
 
-━━━━━━━━━━━━━━━
-💰 **Pair:** `XAUUSD - GOLD`
-📊 **Price:** `${price:.2f}`
-📈 **Action:** {action}
+    if hit_tp:
+        state["wins"]+=1; state["active_trade"]=None; save_state(state)
+        send(f"✅ *TP HIT - PROFIT* 💰\n{side} {entry:.2f} -> {current_price:.2f}\n+${abs(tp-entry):.2f} Profit")
+    elif hit_sl:
+        state["losses"]+=1; state["active_trade"]=None; save_state(state)
+        send(f"❌ *SL HIT - LOSS*\n{side} {entry:.2f} -> {current_price:.2f}\n-${abs(entry-sl):.2f} Loss")
 
-🎯 **ENTRY:** `{entry:.2f}`
-🛑 **STOP LOSS:** `{sl:.2f}` (-100 Pips)
+# START
+send("🚀 *XAUUSD V4 ULTIMATE LIVE*\n\nCommands:\n/on - Bot চালু\n/off - Bot বন্ধ\n/report - লাভ/লস রিপোর্ট\n/price - এখনকার Price")
 
-✅ **TP1:** `{tp1:.2f}` (+100 Pips)
-✅ **TP2:** `{tp2:.2f}` (+200 Pips)
-✅ **TP3:** `{tp3:.2f}` (+350 Pips)
+while True:
+    try:
+        check_commands()
+        if not state["is_on"]:
+            time.sleep(5); continue
 
-━━━━━━━━━━━━━━━
-🧠 **AI Confidence:** `{score}%` {'🟢' if score > 80 else '🟡'}
-📚 **Strategy:** BOS Break + Liquidity Sweep
-⏰ **Timeframe:** M15 / M5 Confirmation
-🕒 **Time:** {now}
+        side, price, sl, tp, score = analyze_xau()
+        if price: check_trade_result(price)
 
-⚠️ **Risk Management:** Use 1-2% Lot Only!
-"""
-    return msg
+        # Price Update
+        if side: # Signal
+            emoji = "🟢📈 BUY" if side=="BUY" else "🔴📉 SELL"
+            state["active_trade"] = {"side": side, "entry": price, "sl": sl, "tp": tp}
+            save_state(state)
+            send(f"🔥 *{emoji} XAUUSD SIGNAL* | Score {score}%\n\n*Entry:* `{price:.2f}`\n*SL:* `{sl:.2f}` ({abs(price-sl):.2f}$)\n*TP:* `{tp:.2f}` ({abs(tp-price):.2f}$)\nRR: 1:1.6\n\nএখন Trade নিতে পারো")
+        else:
+            send(f"💵 *XAUUSD:* `${price:.2f}` | Score: {score}% | No Trade - Waiting...")
 
-# ====== MAIN LOOP ======
-def run_bot():
-    send_telegram("🚀 **PRO GOLD BOT চালু হয়েছে!**\nএখন থেকে শুধু Professional Signal আসবে। WAIT মেসেজ আর আসবে না।")
-    last_signal = ""
-    while True:
-        try:
-            price, sig_type, score, high, low = get_gold_data()
-            if price and sig_type != "WAIT" and score >= 80:
-                # একই Signal বারবার যাতে না যায়
-                signal_id = f"{sig_type}-{int(price)}"
-                if signal_id != last_signal:
-                    pro_msg = format_pro_signal(price, sig_type, score, high, low)
-                    if pro_msg:
-                        send_telegram(pro_msg)
-                        last_signal = signal_id
-            print(f"Checked: {price} - {sig_type} - {score}")
-            time.sleep(180) # 3 মিনিট পর পর চেক
-        except Exception as e:
-            print(f"Loop Error: {e}")
-            time.sleep(60)
-
-threading.Thread(target=run_bot).start()
+        time.sleep(300) # 5 min
+    except Exception as e:
+        print(e); time.sleep(30)
